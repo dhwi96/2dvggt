@@ -1,0 +1,142 @@
+import os
+import csv
+import hashlib
+from collections import defaultdict   # ✅ 이 줄 추가
+from PIL import Image
+import numpy as np
+import torch
+import pyiqa
+
+
+
+# ====== 설정 ======
+REF_DIR  = r"F:/Datasets/gt/hydrant/411_56077_108567/images"          # 참조(정답) 이미지 폴더
+TEST_DIR = r"F:/Datasets/enhanced/my_multiview_enhanced_artion_refon/CO3Dv2_hydrant"
+
+OUT_CSV  = r"F:/Datasets/metrics_pyiqa.csv"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IMG_EXTS = {'.png', '.jpg', '.jpeg'}
+
+# 사용할 지표 (pyiqa 모델명)
+REF_METRICS = ['psnr', 'ssim', 'lpips', 'dists']  # 참조 필요
+NR_METRICS  = ['maniqa', 'clipiqa']               # 무참조
+
+# ====== 유틸 ======
+def load_rgb_tensor(path):
+    img = Image.open(path).convert('RGB')
+    arr = np.array(img)
+    ten = torch.from_numpy(arr).permute(2,0,1).float().unsqueeze(0) / 255.0
+    return ten
+
+def list_by_basename(folder):
+    """폴더 내 이미지들을 base_name -> 파일경로 목록으로 매핑"""
+    mapping = defaultdict(list)
+    for fn in os.listdir(folder):
+        ext = os.path.splitext(fn.lower())[1]
+        if ext in IMG_EXTS:
+            base = os.path.splitext(fn)[0]  # 확장자 제외
+            mapping[base].append(os.path.join(folder, fn))
+    return mapping
+
+def pick_one(paths):
+    """동일 베이스네임에 여러 확장자가 있을 경우 1개 선택(선호 확장 우선)"""
+    if len(paths) == 1:
+        return paths[0]
+    # 선호 확장자 우선순위
+    pref = ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp']
+    paths_sorted = sorted(paths, key=lambda p: pref.index(os.path.splitext(p)[1].lower()) if os.path.splitext(p)[1].lower() in pref else 999)
+    return paths_sorted[0]
+
+def file_hash(path, nbytes=1_000_000):
+    """비정상적으로 높은 점수 디버그용(완전 동일 파일 탐지)"""
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        chunk = f.read(nbytes)  # 전부 읽지 않고 일부만
+        h.update(chunk)
+    return h.hexdigest()
+
+# ====== 모델 준비 ======
+ref_models = {n: pyiqa.create_metric(n, device=DEVICE) for n in REF_METRICS}
+nr_models  = {n: pyiqa.create_metric(n, device=DEVICE) for n in NR_METRICS}
+
+# ====== 매칭 만들기: 베이스네임 교집합만 평가 ======
+ref_map  = list_by_basename(REF_DIR)
+test_map = list_by_basename(TEST_DIR)
+common_bases = sorted(set(ref_map.keys()) & set(test_map.keys()))
+
+print(f"공통 베이스네임 개수: {len(common_bases)}")
+
+rows = []
+acc = {k: [] for k in REF_METRICS + NR_METRICS}
+
+for base in common_bases:
+    ref_path  = pick_one(ref_map[base])
+    test_path = pick_one(test_map[base])
+
+    # 같은 파일 경로면 스킵 (자기 자신 비교 방지 → PSNR/SSIM 50dB+ 방지)
+    if os.path.abspath(ref_path) == os.path.abspath(test_path):
+        print(f"[SKIP] 동일 경로: {base}")
+        continue
+
+    # 텐서 로드
+    ref_t  = load_rgb_tensor(ref_path).to(DEVICE)
+    test_t = load_rgb_tensor(test_path).to(DEVICE)
+
+    # 크기 다르면 결과를 참조 크기에 맞춤
+    if ref_t.shape[-2:] != test_t.shape[-2:]:
+        ref_h, ref_w = ref_t.shape[-2], ref_t.shape[-1]
+        test_img = Image.open(test_path).convert('RGB').resize((ref_w, ref_h), Image.BICUBIC)
+        test_t = torch.from_numpy(np.array(test_img)).permute(2,0,1).float().unsqueeze(0).to(DEVICE) / 255.0
+
+    with torch.no_grad():
+        result = {}
+
+        # 참조 기반
+        for name, model in ref_models.items():
+            score = model(test_t, ref_t)
+            score = float(score.detach().cpu().item()) if torch.is_tensor(score) else float(score)
+            result[name] = score
+
+        # 무참조(결과만)
+        for name, model in nr_models.items():
+            score = model(test_t)
+            score = float(score.detach().cpu().item()) if torch.is_tensor(score) else float(score)
+            result[name] = score
+
+    # 비정상 값 모니터링(디버깅 메시지)
+    if result['psnr'] >= 50 or result['ssim'] >= 0.99:
+        # 해시 일부 비교로 동일 파일 가능성/과도한 유사도 체크
+        try:
+            h_ref  = file_hash(ref_path)
+            h_test = file_hash(test_path)
+            if h_ref == h_test:
+                print(f"[WARN] 거의 동일 파일로 추정(해시 일치): {base}")
+        except Exception:
+            pass
+
+    for k in acc.keys():
+        acc[k].append(result[k])
+
+    row = {'filename': base, **result}
+    rows.append(row)
+
+# ====== CSV 저장 ======
+os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+fields = ['filename'] + list(acc.keys())
+with open(OUT_CSV, 'w', newline='', encoding='utf-8') as f:
+    w = csv.DictWriter(f, fieldnames=fields)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    # 평균
+    mean_row = {'filename': 'MEAN'}
+    for k,v in acc.items():
+        mean_row[k] = float(np.mean(v)) if len(v)>0 else float('nan')
+    w.writerow(mean_row)
+
+# ====== 요약 출력 ======
+print("\n=== 평균 결과(공통 매칭만) ===")
+for k, v in acc.items():
+    print(f"{k:8s}: {float(np.mean(v)):.4f} (N={len(v)})" if v else f"{k:8s}: N/A")
+print(f"\nCSV 저장: {OUT_CSV}")
